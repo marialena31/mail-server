@@ -1,236 +1,172 @@
 const nodemailer = require('nodemailer');
 
-class MailService {
-  constructor() {
-    this.transporter = null;
-    this.testAccount = null;
-  }
+// Mail service singleton
+const createMailService = () => {
+    let transporter = null;
+    let testAccount = null;
 
-  async createFakeTransporter() {
-    try {
-      this.testAccount = await nodemailer.createTestAccount();
-      this.transporter = nodemailer.createTransport({
-        host: 'smtp.ethereal.email',
-        port: 587,
-        secure: false,
-        auth: {
-          user: this.testAccount.user,
-          pass: this.testAccount.pass,
-        },
-      });
+    const initialize = async () => {
+        try {
+            // Log SMTP configuration (excluding sensitive data)
+            console.log('SMTP Configuration:', {
+                host: process.env.SMTP_HOST,
+                port: process.env.SMTP_PORT,
+                secure: process.env.SMTP_SECURE === 'true',
+                user: process.env.SMTP_USER,
+                from: process.env.SMTP_FROM
+            });
 
-      console.log('Test Email Account:', {
-        user: this.testAccount.user,
-        pass: this.testAccount.pass,
-        previewUrl: 'https://ethereal.email'
-      });
+            if (process.env.USE_FAKE_MAILER === 'true') {
+                console.log('Using fake mailer (Ethereal)');
+                testAccount = await nodemailer.createTestAccount();
+                transporter = nodemailer.createTransport({
+                    host: 'smtp.ethereal.email',
+                    port: 587,
+                    secure: false,
+                    auth: {
+                        user: testAccount.user,
+                        pass: testAccount.pass,
+                    },
+                });
+            } else {
+                console.log('Using real SMTP server');
+                transporter = nodemailer.createTransport({
+                    host: process.env.SMTP_HOST,
+                    port: parseInt(process.env.SMTP_PORT),
+                    secure: process.env.SMTP_SECURE === 'true',
+                    auth: {
+                        user: process.env.SMTP_USER,
+                        pass: process.env.SMTP_PASS,
+                    },
+                    tls: {
+                        // Do not fail on invalid certs
+                        rejectUnauthorized: false
+                    }
+                });
+            }
+            return transporter;
+        } catch (error) {
+            console.error('Error initializing mail service:', error);
+            throw error;
+        }
+    };
 
-      return this.transporter;
-    } catch (error) {
-      console.error('Failed to create fake transporter:', error);
-      throw error;
-    }
-  }
+    const getTransporter = async () => {
+        if (!transporter) {
+            transporter = await initialize();
+        }
+        return transporter;
+    };
 
-  createRealTransporter() {
-    try {
-      this.transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST,
-        port: parseInt(process.env.SMTP_PORT),
-        secure: process.env.SMTP_SECURE === 'true',
-        auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS,
-        },
-      });
+    return {
+        getTransporter,
+        getTestAccount: () => testAccount
+    };
+};
 
-      return this.transporter;
-    } catch (error) {
-      console.error('Failed to create real transporter:', error);
-      throw error;
-    }
-  }
-
-  async initialize() {
-    const useFakeMailer = process.env.NODE_ENV !== 'production' && process.env.USE_FAKE_MAILER === 'true';
-    
-    if (useFakeMailer) {
-      console.log('Initializing fake mail transporter for development...');
-      await this.createFakeTransporter();
-    } else {
-      console.log('Initializing real SMTP transporter...');
-      this.createRealTransporter();
-    }
-
-    // Verify the connection
-    try {
-      await this.transporter.verify();
-      console.log('Mail transport initialized and verified');
-    } catch (error) {
-      console.error('Failed to verify mail transport:', error);
-      throw error;
-    }
-  }
-
-  getTransporter() {
-    if (!this.transporter) {
-      throw new Error('Mail transport not initialized');
-    }
-    return this.transporter;
-  }
-
-  getTestAccount() {
-    return this.testAccount;
-  }
-}
-
-// Create singleton instance
-const mailService = new MailService();
-
-// Initialize the mail service
-mailService.initialize().catch(console.error);
+const mailService = createMailService();
 
 // Controller functions
-exports.sendEmail = async (req, res) => {
-  try {
-    const { to, subject, text, html } = req.body;
+const validator = require('validator');
 
-    if (!to || !subject || (!text && !html)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Missing required fields' 
-      });
+exports.sendMail = async (req, res) => {
+    try {
+        const { to, subject, text } = req.body;
+
+        // Validation stricte
+        if (!to || !subject || !text) {
+            return res.status(400).json({
+                error: 'Missing required fields',
+                message: 'Please provide to, subject, and text fields'
+            });
+        }
+        if (!validator.isEmail(to)) {
+            return res.status(400).json({ error: 'Invalid email address' });
+        }
+        if (!validator.isLength(subject, { min: 3, max: 200 })) {
+            return res.status(400).json({ error: 'Subject length invalid' });
+        }
+        if (!validator.isLength(text, { min: 10, max: 5000 })) {
+            return res.status(400).json({ error: 'Message length invalid' });
+        }
+
+        // Sanitation
+        const cleanSubject = validator.escape(subject);
+        const cleanText = validator.escape(text);
+
+        const transporter = await mailService.getTransporter();
+
+        const mailOptions = {
+            from: process.env.SMTP_FROM,
+            to,
+            subject: cleanSubject,
+            text: cleanText
+        };
+
+        const info = await transporter.sendMail(mailOptions);
+
+        const response = {
+            messageId: info.messageId,
+            success: true
+        };
+
+        if (process.env.USE_FAKE_MAILER === 'true') {
+            response.previewUrl = nodemailer.getTestMessageUrl(info);
+        }
+
+        res.json(response);
+    } catch (error) {
+        console.error('Error sending email:', error);
+        res.status(500).json({
+            error: 'Failed to send email',
+            message: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error',
+            details: process.env.NODE_ENV === 'development' ? error.toString() : undefined
+        });
     }
-
-    const transporter = mailService.getTransporter();
-    const mailOptions = {
-      from: process.env.SMTP_FROM || transporter.options.auth.user,
-      to,
-      subject,
-      text,
-      html,
-    };
-
-    const info = await transporter.sendMail(mailOptions);
-    
-    // If using fake mailer, include the preview URL
-    const testAccount = mailService.getTestAccount();
-    const response = {
-      success: true,
-      message: 'Email sent successfully',
-      messageId: info.messageId
-    };
-
-    if (testAccount) {
-      response.previewUrl = nodemailer.getTestMessageUrl(info);
-      response.note = 'This is a test email. Check the previewUrl to see the email content.';
-    }
-
-    res.status(200).json(response);
-  } catch (error) {
-    console.error('Error sending email:', error);
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to send email', 
-      error: error.message 
-    });
-  }
 };
 
 exports.getStatus = async (req, res) => {
-  try {
-    const transporter = mailService.getTransporter();
-    await transporter.verify();
-    
-    const testAccount = mailService.getTestAccount();
-    const response = {
-      success: true,
-      status: 'Mail server is operational',
-      mode: testAccount ? 'development (fake mailer)' : 'production'
-    };
-
-    if (testAccount) {
-      response.testAccount = {
-        user: testAccount.user,
-        previewUrl: 'https://ethereal.email'
-      };
+    try {
+        const transporter = await mailService.getTransporter();
+        await transporter.verify();
+        
+        res.json({
+            status: 'operational',
+            timestamp: new Date().toISOString(),
+            useFakeMailer: process.env.USE_FAKE_MAILER === 'true',
+            smtpConfig: {
+                host: process.env.SMTP_HOST,
+                port: process.env.SMTP_PORT,
+                secure: process.env.SMTP_SECURE === 'true',
+                user: process.env.SMTP_USER,
+                from: process.env.SMTP_FROM
+            }
+        });
+    } catch (error) {
+        console.error('Mail server error:', error);
+        res.status(500).json({
+            status: 'error',
+            message: 'Mail server is not responding',
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Connection failed',
+            details: process.env.NODE_ENV === 'development' ? {
+                host: process.env.SMTP_HOST,
+                port: process.env.SMTP_PORT,
+                secure: process.env.SMTP_SECURE === 'true',
+                user: process.env.SMTP_USER,
+                from: process.env.SMTP_FROM,
+                error: error.toString()
+            } : undefined
+        });
     }
-
-    res.status(200).json(response);
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      status: 'Mail server is not responding',
-      error: error.message 
-    });
-  }
 };
 
-exports.getConfig = (req, res) => {
-  try {
-    const transporter = mailService.getTransporter();
-    const testAccount = mailService.getTestAccount();
-
-    const config = {
-      mode: testAccount ? 'development (fake mailer)' : 'production',
-      host: transporter.options.host,
-      port: transporter.options.port,
-      secure: transporter.options.secure,
-      defaultSender: process.env.SMTP_FROM || transporter.options.auth.user
-    };
-
-    res.status(200).json(config);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Failed to get mail server configuration',
-      error: error.message
+exports.getConfig = async (req, res) => {
+    res.json({
+        useFakeMailer: process.env.USE_FAKE_MAILER === 'true',
+        smtpHost: process.env.SMTP_HOST,
+        smtpPort: process.env.SMTP_PORT,
+        smtpSecure: process.env.SMTP_SECURE === 'true',
+        smtpUser: process.env.SMTP_USER,
+        smtpFrom: process.env.SMTP_FROM
     });
-  }
-};
-
-exports.updateConfig = async (req, res) => {
-  try {
-    const testAccount = mailService.getTestAccount();
-    if (testAccount) {
-      return res.status(400).json({
-        success: false,
-        message: 'Cannot update configuration while using fake mailer. Set USE_FAKE_MAILER=false to use real SMTP.'
-      });
-    }
-
-    const { host, port, secure, user, pass } = req.body;
-    
-    // Create new transporter with updated config
-    const newTransporter = nodemailer.createTransport({
-      host,
-      port,
-      secure,
-      auth: { user, pass }
-    });
-
-    // Verify the new configuration
-    await newTransporter.verify();
-
-    // Update environment variables
-    process.env.SMTP_HOST = host;
-    process.env.SMTP_PORT = port;
-    process.env.SMTP_SECURE = secure;
-    process.env.SMTP_USER = user;
-    process.env.SMTP_PASS = pass;
-
-    // Update the service transporter
-    mailService.transporter = newTransporter;
-
-    res.status(200).json({ 
-      success: true, 
-      message: 'Mail server configuration updated successfully' 
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: 'Failed to update mail server configuration',
-      error: error.message 
-    });
-  }
 };
