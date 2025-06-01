@@ -12,13 +12,16 @@
     "vercel-build": "echo hello"
   },
   "dependencies": {
+    "@sentry/node": "^9.24.0",
+    "axios": "^1.9.0",
     "body-parser": "^1.20.2",
     "cookie-parser": "^1.4.6",
     "cors": "^2.8.5",
     "csrf-csrf": "^3.0.1",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
-    "express-rate-limit": "^7.1.5",
+    "express-rate-limit": "^7.5.0",
+
     "helmet": "^7.1.0",
     "multer": "^2.0.0",
     "nodemailer": "^6.9.7",

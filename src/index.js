@@ -1,5 +1,13 @@
 require('dotenv').config();
+// --- SENTRY ---
+const Sentry = require('@sentry/node');
+Sentry.init({
+  dsn: process.env.SENTRY_DSN, // Ajoute SENTRY_DSN=... dans ton .env
+  tracesSampleRate: 0.0 // Pas besoin de traces de perf ici
+});
+// --------------
 const express = require('express');
+const rateLimit = require('express-rate-limit');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const { apiKeyAuth } = require('./middleware/auth.middleware');
@@ -58,8 +66,15 @@ app.use((req, res, next) => {
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  console.error('UNCAUGHT ERROR:', err);
+  if (err && err.stack) {
+    console.error(err.stack);
+  }
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: err && err.message ? err.message : String(err),
+    details: err && err.stack ? err.stack : undefined
+  });
 });
 
 // Public endpoints (no auth required)
@@ -74,8 +89,16 @@ app.get('/health', (req, res) => {
 // Protected routes
 app.use('/api', apiKeyAuth);
 
+// Rate limiting strict pour l'envoi de mail (5 req/min/IP)
+const sendLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 5,
+  message: 'Trop de requêtes. Veuillez réessayer plus tard.'
+});
+
 // Endpoint d'envoi de mail avec pièce jointe (champ 'file' optionnel)
-app.post('/api/mail/send', upload.single('file'), async (req, res, next) => {
+app.post('/api/mail/send', sendLimiter, upload.single('file'), async (req, res, next) => {
+  console.log('--- Nouvelle requête upload reçue ---');
   try {
     // Contrôles de base
     const allowedExt = ['.pdf', '.png', '.jpg', '.jpeg'];
@@ -92,62 +115,57 @@ app.post('/api/mail/send', upload.single('file'), async (req, res, next) => {
         fs.unlinkSync(req.file.path);
         return res.status(400).json({ error: 'Fichier trop volumineux (max 5Mo)' });
       }
-      // Scan VirusTotal si clé présente et non désactivé
-      const scanEnabled = process.env.FILE_SCAN_ENABLED !== 'false';
-      if (scanEnabled && process.env.VIRUSTOTAL_API_KEY) {
-        const axios = require('axios');
-        const fsRead = require('fs').readFileSync;
-        const fileBuffer = fsRead(req.file.path);
-        try {
-          const vtResp = await axios.post('https://www.virustotal.com/api/v3/files', fileBuffer, {
-            headers: {
-              'x-apikey': process.env.VIRUSTOTAL_API_KEY,
-              'Content-Type': 'application/octet-stream'
-            }
-          });
-          const analysisId = vtResp.data.data.id;
-          // Poll l'analyse jusqu'à résultat
-          let verdict = null;
-          for (let i = 0; i < 10; i++) {
-            await new Promise(r => setTimeout(r, 2000));
-            const report = await axios.get(`https://www.virustotal.com/api/v3/analyses/${analysisId}`, {
-              headers: { 'x-apikey': process.env.VIRUSTOTAL_API_KEY }
-            });
-            if (report.data.data.attributes.status === 'completed') {
-              verdict = report.data.data.attributes.stats.malicious;
-              break;
-            }
-          }
-          if (verdict && verdict > 0) {
-            fs.unlinkSync(req.file.path);
-            return res.status(400).json({ error: 'Fichier détecté comme malveillant par VirusTotal' });
-          }
-        } catch (vtErr) {
-          // Gestion quota VirusTotal
-          if (vtErr.response && vtErr.response.status === 429) {
-            // Envoi mail d'alerte à SMTP_USER
-            try {
-              const nodemailer = require('nodemailer');
-              const transporter = await require('./controllers/mail.controller').mailService.getTransporter();
-              await transporter.sendMail({
-                from: process.env.SMTP_FROM,
-                to: process.env.SMTP_USER,
-                subject: '[Mail API] Quota VirusTotal dépassé',
-                text: 'Le quota VirusTotal API a été dépassé. Les fichiers ne sont plus scannés. Veuillez vérifier votre compte VirusTotal.'
-              });
-            } catch (mailErr) {
-              console.error('Erreur lors de l’envoi du mail d’alerte VirusTotal:', mailErr);
-            }
-            fs.unlinkSync(req.file.path);
-            return res.status(429).json({ error: 'Quota VirusTotal dépassé. Le scan antivirus est temporairement indisponible.' });
-          }
-          // Autre erreur VirusTotal
-          fs.unlinkSync(req.file.path);
-          return res.status(500).json({ error: 'Erreur lors du scan VirusTotal', details: vtErr.message });
-        }
-      }
     }
-    // Passe au contrôleur mail avec fichier
+    // --- VALIDATION & SANITATION ---
+    const validator = require('validator');
+    const sanitizeInput = (input) =>
+      validator.escape(input.toString().trim().replace(/[\r\n\t]/g, ' '));
+
+    // Champs requis
+    const from = req.body.from && validator.isEmail(req.body.from.trim()) ? req.body.from.trim() : null;
+    const to = req.body.to && validator.isEmail(req.body.to.trim()) ? req.body.to.trim() : null;
+    let subject = req.body.subject ? sanitizeInput(req.body.subject) : '';
+    let text = req.body.text ? sanitizeInput(req.body.text) : '';
+
+    // Validation stricte
+    if (!from || !to || !subject || !text) {
+      if (typeof Sentry.captureMessage === 'function') {
+        Sentry.captureMessage(
+          `[ALERTE][Validation] Tentative d'envoi avec champ(s) invalide(s) : from=${from}, to=${to}, subject=${subject}`,
+          'warning'
+        );
+      }
+      if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(400).json({
+        error: 'Champs requis manquants ou invalides',
+        details: { from, to, subject, text }
+      });
+    }
+
+    // Limite la taille du texte (anti spam/injection)
+    if (text.length > 5000 || subject.length > 255) {
+      if (typeof Sentry.captureMessage === 'function') {
+        Sentry.captureMessage(
+          `[ALERTE][Validation] Tentative d'envoi avec texte ou sujet trop long : subject.length=${subject.length}, text.length=${text.length}`,
+          'warning'
+        );
+      }
+      if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+      return res.status(400).json({
+        error: 'Texte ou sujet trop long',
+        details: { subjectLength: subject.length, textLength: text.length }
+      });
+    }
+
+    // Passe au contrôleur mail avec fichier et champs validés
+    req.body.from = from;
+    req.body.to = to;
+    req.body.subject = subject;
+    req.body.text = text;
     req.attachment = req.file || null;
     mailController.sendMail(req, res, next);
   } catch (error) {
@@ -162,6 +180,11 @@ app.get('/api/mail/config', mailController.getConfig);
 
 // Global error handler
 app.use((err, req, res, next) => {
+  // Capture l'erreur dans Sentry (compatible v8+)
+  if (typeof Sentry.captureException === 'function') {
+    Sentry.captureException(err);
+  }
+
     console.error('Error:', err);
     res.status(err.status || 500).json({
         error: err.message || 'Internal Server Error',
