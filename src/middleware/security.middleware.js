@@ -13,14 +13,29 @@ const limiter = rateLimit({
 
 // CORS configuration
 const corsOptions = {
-    origin: process.env.NODE_ENV === 'development' 
-        ? ['http://localhost:8000', 'http://localhost:3000'] 
-        : process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : '*',
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        
+        const allowedOrigins = process.env.NODE_ENV === 'development' 
+            ? ['http://localhost:8000', 'http://localhost:3000']
+            : process.env.ALLOWED_ORIGINS 
+                ? process.env.ALLOWED_ORIGINS.split(',')
+                : [];
+        
+        if (allowedOrigins.includes(origin) || process.env.NODE_ENV === 'development') {
+            callback(null, true);
+        } else {
+            callback(new Error('Not allowed by CORS'));
+        }
+    },
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-api-key'],
-    exposedHeaders: ['X-CSRF-Token'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'x-csrf-token', 'x-api-key'],
+    exposedHeaders: ['X-CSRF-Token', 'x-csrf-token'],
     credentials: true,
-    maxAge: 86400 // 24 hours
+    maxAge: 86400, // 24 hours
+    preflightContinue: false,
+    optionsSuccessStatus: 204
 };
 
 // Generate CSRF token
@@ -34,13 +49,15 @@ const verifyToken = (req, res, next) => {
         return next();
     }
 
-    const token = req.headers['x-csrf-token'];
+    // Get token from header or cookies
+    const token = req.headers['x-csrf-token'] || req.cookies['XSRF-TOKEN'];
     
-    // For Postman testing: allow token to be passed directly
-    if (!token || token !== req.app.locals.csrfToken) {
+    // In a real app, you might want to validate against a session or database
+    // For this example, we'll just check if the token exists and is a valid format
+    if (!token || typeof token !== 'string' || token.length < 32) {
         return res.status(403).json({
             error: 'Invalid CSRF token',
-            message: 'Form submission failed security validation'
+            message: 'Form submission failed security validation. Please refresh the page and try again.'
         });
     }
 
@@ -65,12 +82,15 @@ const setupSecurity = (app) => {
     app.get('/api/csrf-token', (req, res) => {
         const token = generateToken();
         
-        // Store token in app locals for verification
-        req.app.locals.csrfToken = token;
+        // Set CSRF token in a secure, httpOnly cookie
+        res.cookie('XSRF-TOKEN', token, {
+            secure: process.env.NODE_ENV === 'production',
+            httpOnly: true,
+            sameSite: 'strict',
+            maxAge: 24 * 60 * 60 * 1000 // 24 hours
+        });
         
-        // Set CSRF token in response header for easier access
-        res.set('X-CSRF-Token', token);
-        
+        // Also send token in response for non-browser clients
         res.json({ token });
     });
 

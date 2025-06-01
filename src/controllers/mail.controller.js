@@ -70,23 +70,36 @@ const mailService = createMailService();
 const validator = require('validator');
 
 exports.sendMail = async (req, res) => {
+    const fs = require('fs');
     try {
         const { to, subject, text } = req.body;
 
         // Validation stricte
         if (!to || !subject || !text) {
+            if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+                fs.unlinkSync(req.attachment.path);
+            }
             return res.status(400).json({
                 error: 'Missing required fields',
                 message: 'Please provide to, subject, and text fields'
             });
         }
         if (!validator.isEmail(to)) {
+            if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+                fs.unlinkSync(req.attachment.path);
+            }
             return res.status(400).json({ error: 'Invalid email address' });
         }
         if (!validator.isLength(subject, { min: 3, max: 200 })) {
+            if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+                fs.unlinkSync(req.attachment.path);
+            }
             return res.status(400).json({ error: 'Subject length invalid' });
         }
         if (!validator.isLength(text, { min: 10, max: 5000 })) {
+            if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+                fs.unlinkSync(req.attachment.path);
+            }
             return res.status(400).json({ error: 'Message length invalid' });
         }
 
@@ -103,7 +116,32 @@ exports.sendMail = async (req, res) => {
             text: cleanText
         };
 
+        // Ajout de la pièce jointe si présente
+        if (req.attachment) {
+            // Dernier contrôle de sécurité (extension/mimetype)
+            const pathMod = require('path');
+            const allowedExt = ['.pdf', '.png', '.jpg', '.jpeg'];
+            const allowedMime = ['application/pdf', 'image/png', 'image/jpeg'];
+            const ext = pathMod.extname(req.attachment.originalname).toLowerCase();
+            if (!allowedExt.includes(ext) || !allowedMime.includes(req.attachment.mimetype)) {
+                fs.unlinkSync(req.attachment.path);
+                return res.status(400).json({ error: 'Type de fichier non autorisé (contrôle final)' });
+            }
+            mailOptions.attachments = [
+                {
+                    filename: req.attachment.originalname,
+                    path: req.attachment.path,
+                    contentType: req.attachment.mimetype
+                }
+            ];
+        }
+
         const info = await transporter.sendMail(mailOptions);
+
+        // Supprime le fichier temporaire après envoi
+        if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+            fs.unlinkSync(req.attachment.path);
+        }
 
         const response = {
             messageId: info.messageId,
@@ -116,6 +154,10 @@ exports.sendMail = async (req, res) => {
 
         res.json(response);
     } catch (error) {
+        // Nettoyage du fichier temporaire en cas d'erreur
+        if (req.attachment && req.attachment.path && fs.existsSync(req.attachment.path)) {
+            fs.unlinkSync(req.attachment.path);
+        }
         console.error('Error sending email:', error);
         res.status(500).json({
             error: 'Failed to send email',
